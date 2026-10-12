@@ -110,7 +110,12 @@ jobs:
           channel: stable
       - run: flutter create --platforms=android,windows --project-name makusanyo .
       - name: Jina la dirisha
-        run: (Get-Content windows/runner/main.cpp) -replace 'L\"makusanyo\"','L\"Mfumo wa Makusanyo ya Pesa\"' | Set-Content windows/runner/main.cpp
+        shell: pwsh
+        run: |
+          $f = "windows/runner/main.cpp"
+          $c = [System.IO.File]::ReadAllText($f)
+          $c = $c.Replace('"makusanyo"', '"Mfumo wa Makusanyo ya Pesa"')
+          [System.IO.File]::WriteAllText($f, $c)
       - run: flutter pub get
       - run: dart run flutter_launcher_icons
       - run: flutter build windows --release
