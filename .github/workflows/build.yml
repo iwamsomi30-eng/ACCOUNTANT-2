@@ -1,0 +1,151 @@
+name: Build APK na Installer
+
+# Inajengwa kwa mkono tu (Actions > Build APK na Installer > Run workflow).
+# Hii inaokoa dakika za GitHub: kila commit haitaanzisha build tena.
+on:
+  workflow_dispatch:
+
+# Ukibonyeza Run mara mbili, ya zamani inafutwa ili isitumie dakika bure.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter create --platforms=android --project-name makusanyo .
+      - name: Jina la app kwenye simu
+        run: sed -i 's/android:label=\"makusanyo\"/android:label=\"Makusanyo WAWATA\"/' android/app/src/main/AndroidManifest.xml
+
+      # Sahihi ile ile (keystore moja) kila build, ili APK mpya isakinishwe juu ya ya zamani (update)
+      # bila kuifuta. Bila secrets, APK itasainiwa kwa debug key (inasakinishwa lakini update
+      # kutoka build tofauti inaweza kukataa).
+      - name: Weka sahihi ya Release (kama secrets zipo)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::Hakuna ANDROID_KEYSTORE_BASE64 secret. APK itasainiwa kwa debug key."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+          cat > android/key.properties <<PROPS
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=upload-keystore.jks
+          PROPS
+          sed -i 's/^ *//' android/key.properties
+          python3 - <<'PY'
+          import re, pathlib
+          kts = pathlib.Path("android/app/build.gradle.kts")
+          grv = pathlib.Path("android/app/build.gradle")
+          if kts.exists():
+              s = kts.read_text()
+              # plugins {} lazima abaki kwanza; imports juu kabisa, val kabla ya android {}
+              s = 'import java.util.Properties\nimport java.io.FileInputStream\n\n' + s
+              s = s.replace("\nandroid {",
+                  '\nval keystoreProperties = Properties().apply {\n'
+                  '    val f = rootProject.file("key.properties")\n'
+                  '    if (f.exists()) load(FileInputStream(f))\n}\n\nandroid {', 1)
+              s = s.replace("buildTypes {",
+                  'signingConfigs {\n        create("release") {\n'
+                  '            keyAlias = keystoreProperties["keyAlias"] as String\n'
+                  '            keyPassword = keystoreProperties["keyPassword"] as String\n'
+                  '            storeFile = file(keystoreProperties["storeFile"] as String)\n'
+                  '            storePassword = keystoreProperties["storePassword"] as String\n'
+                  '        }\n    }\n\n    buildTypes {', 1)
+              s = s.replace('signingConfigs.getByName("debug")', 'signingConfigs.getByName("release")')
+              kts.write_text(s)
+          elif grv.exists():
+              s = grv.read_text()
+              s = s.replace("\nandroid {",
+                  '\ndef keystoreProperties = new Properties()\n'
+                  'def keystorePropertiesFile = rootProject.file("key.properties")\n'
+                  'if (keystorePropertiesFile.exists()) {\n'
+                  '    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n}\n\nandroid {', 1)
+              s = s.replace("buildTypes {",
+                  'signingConfigs {\n        release {\n'
+                  '            keyAlias keystoreProperties["keyAlias"]\n'
+                  '            keyPassword keystoreProperties["keyPassword"]\n'
+                  '            storeFile file(keystoreProperties["storeFile"])\n'
+                  '            storePassword keystoreProperties["storePassword"]\n'
+                  '        }\n    }\n\n    buildTypes {', 1)
+              s = s.replace("signingConfig signingConfigs.debug", "signingConfig signingConfigs.release")
+              grv.write_text(s)
+          else:
+              raise SystemExit("build.gradle haikupatikana")
+          PY
+
+      - run: flutter pub get
+      - run: dart run flutter_launcher_icons
+      # APK moja kwa simu zote: arm64 (simu nyingi mpya), armeabi-v7a (simu za zamani), x86_64 (emulator/Chromebook).
+      # minSdk inabaki ile ya chini kabisa inayoungwa mkono na Flutter, ili Android nyingi zaidi zisakinishe.
+      - run: flutter build apk --release --target-platform android-arm,android-arm64,android-x64
+      - name: Jina la APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk Makusanyo-Android-Zote.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Makusanyo-APK
+          path: Makusanyo-Android-Zote.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter create --platforms=android,windows --project-name makusanyo .
+      - name: Jina la dirisha
+        run: (Get-Content windows/runner/main.cpp) -replace 'L\"makusanyo\"','L\"Mfumo wa Makusanyo ya Pesa\"' | Set-Content windows/runner/main.cpp
+      - run: flutter pub get
+      - run: dart run flutter_launcher_icons
+      - run: flutter build windows --release
+
+      # PC safi (isiyo na Visual C++ Redistributable) hushindwa kufungua app:
+      # "VCRUNTIME140_1.dll was not found". Tunaweka DLL hizo ndani ya folda ya app (app-local).
+      - name: Weka Visual C++ runtime ndani ya app
+        shell: pwsh
+        run: |
+          $dest = "build\windows\x64\runner\Release"
+          $names = "msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll"
+          $crt = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          foreach ($n in $names) {
+            $src = $null
+            if ($crt) { $c = Join-Path $crt.FullName $n; if (Test-Path $c) { $src = $c } }
+            if (-not $src) { $c = Join-Path $env:SystemRoot "System32\$n"; if (Test-Path $c) { $src = $c } }
+            if (-not $src) { throw "Haikupatikana: $n" }
+            Copy-Item $src $dest -Force
+            Write-Host "Imenakiliwa: $n kutoka $src"
+          }
+
+      - name: Sakinisha Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Tengeneza Installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\makusanyo.iss'
+
+      # Toleo la "portable" (ZIP): kwa PC zinazozuia installer. Toa zip, bonyeza makusanyo.exe.
+      - name: Tengeneza ZIP ya portable
+        shell: pwsh
+        run: Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "Makusanyo-Windows-Portable.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Makusanyo-Windows-Installer
+          path: |
+            installer/output/Makusanyo-Setup.exe
+            Makusanyo-Windows-Portable.zip
